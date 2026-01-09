@@ -23,6 +23,8 @@ threading
 
 Windows APIs (win32gui / win32api)
 
+---
+
 🧠 Core Capabilities
 
 Here’s what ODOO AI can do:
