@@ -1,6 +1,7 @@
 import os
 import time
 import base64
+import json
 from io import BytesIO
 from PIL import Image, ImageTk, ImageDraw
 import mss
@@ -16,6 +17,9 @@ UPDATE_INTERVAL = 30  # seconds
 ICON_PATH = r"C:\Users\Alexa\Desktop\Finance Matters Bestanden\ODOO AI\ODOO_AI_LOGO.png"
 PADDING_X = 20
 PADDING_Y = 50
+DEBUG_MODEL_IO = False  # Set to True to log model input/output for debugging
+PRIMARY_MODEL = "gpt-5-mini"
+FALLBACK_MODEL = "gpt-4.1-mini"
 # ---------------------------------------- #
 
 api_key = os.getenv("OPENAI_API_KEY")
@@ -24,18 +28,121 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-# ---------- Warm-up (fix NameError) ---------- #
+# ---------- Smoke test and warm-up ---------- #
+def debug_test_text_only():
+    """Quick smoke test to verify model/key works without images."""
+    try:
+        resp = client.responses.create(
+            model=PRIMARY_MODEL,
+            input="What is 1+1?"
+        )
+        output = resp.output_text if hasattr(resp, 'output_text') else ""
+        print(f"[SMOKE TEST] Model: {PRIMARY_MODEL}, Output: {output}")
+        if not output:
+            # Try fallback
+            try:
+                resp = client.responses.create(
+                    model=FALLBACK_MODEL,
+                    input="What is 1+1?"
+                )
+                output = resp.output_text if hasattr(resp, 'output_text') else ""
+                print(f"[SMOKE TEST] Fallback model: {FALLBACK_MODEL}, Output: {output}")
+            except Exception as e:
+                print(f"[SMOKE TEST] Fallback model also failed: {e}")
+    except Exception as e:
+        print(f"[SMOKE TEST] Failed: {e}")
+
 def warm_up_model():
     try:
-        _ = client.chat.completions.create(
-            model="gpt-5",
-            messages=[{"role": "system", "content": "warmup"}],
-            max_completion_tokens=1
+        _ = client.responses.create(
+            model=PRIMARY_MODEL,
+            input="warmup",
+            max_output_tokens=1
         )
     except Exception:
         pass
 
 # ---------- Utility ---------- #
+def extract_text_from_content(content) -> str:
+    """
+    Robustly extract text from OpenAI model response content.
+    Handles multiple formats:
+    - content is a string
+    - content is a list of dict blocks, e.g. {"type":"text","text":"..."}
+    - content is a list of objects/blocks (newer OpenAI SDK style) with .type and .text attributes
+    - content is missing or None
+    
+    Returns: trimmed string, or "" if nothing is found.
+    """
+    if content is None:
+        return ""
+    
+    if isinstance(content, str):
+        return content.strip()
+    
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            text_val = None
+            
+            # Handle dict format: {"type": "text", "text": "..."}
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    text_val = part.get("text", "")
+            
+            # Handle object format (newer SDK style) with .type and .text attributes
+            elif hasattr(part, "type") and hasattr(part, "text"):
+                if getattr(part, "type", None) == "text":
+                    text_val = getattr(part, "text", "")
+            
+            # Fallback: try to get "text" attribute directly
+            elif hasattr(part, "text"):
+                text_val = getattr(part, "text", "")
+            
+            if text_val:
+                text_val = str(text_val).strip()
+                if text_val:
+                    parts.append(text_val)
+        
+        return " ".join(parts).strip()
+    
+    # Fallback: try to convert to string
+    try:
+        return str(content).strip()
+    except Exception:
+        return ""
+
+def prepare_image_for_upload(img) -> bytes:
+    """
+    Optimize screenshot for upload by resizing and compressing.
+    - Resize width to <= 1024px while preserving aspect ratio
+    - Encode as JPEG quality ~70 instead of PNG
+    
+    Returns: bytes of the optimized image
+    """
+    # Resize if width > 1024
+    width, height = img.size
+    if width > 1024:
+        ratio = 1024 / width
+        new_width = 1024
+        new_height = int(height * ratio)
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+    
+    # Convert to RGB if necessary (JPEG doesn't support transparency)
+    if img.mode in ("RGBA", "LA", "P"):
+        rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        rgb_img.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+        img = rgb_img
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    
+    # Save as JPEG with quality 70
+    buffered = BytesIO()
+    img.save(buffered, format="JPEG", quality=70, optimize=True)
+    return buffered.getvalue()
+
 def capture_screen():
     """Capture a reduced-size central region of the screen (for faster upload)."""
     with mss.mss() as sct:
@@ -59,9 +166,8 @@ def get_active_window_title():
 
 def analyze_screen(img):
     """Send screen image to GPT-5 for one concise, screen-based observation."""
-    buffered = BytesIO()
-    img.save(buffered, format="PNG")
-    img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    img_bytes = prepare_image_for_upload(img)
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
     prompt = (
         f"You are {ASSISTANT_NAME}, an accounting/Odoo assistant. You can SEE the screenshot. "
@@ -72,35 +178,62 @@ def analyze_screen(img):
     )
 
     try:
-        resp = client.chat.completions.create(
-            model="gpt-5",
-            messages=[{
+        # Try primary model first
+        resp = client.responses.create(
+            model=PRIMARY_MODEL,
+            input=[{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
                 ]
             }],
-            max_completion_tokens=50
+            max_output_tokens=50
         )
 
-        text = ""
-        content = resp.choices[0].message.content
-        if isinstance(content, str):
-            text = content.strip()
-        elif isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    val = part.get("text", "").strip()
-                    if val:
-                        parts.append(val)
-            text = " ".join(parts).strip()
+        text = resp.output_text if hasattr(resp, 'output_text') else ""
+        if text:
+            text = text.strip()
+        
+        # Debug logging
+        if DEBUG_MODEL_IO:
+            print(f"[DEBUG analyze_screen] output_text: {text[:300] if text else '(empty)'}")
+            if not text:
+                try:
+                    if hasattr(resp, 'model_dump'):
+                        resp_repr = json.dumps(resp.model_dump(), default=str, indent=2)[:500]
+                    else:
+                        resp_repr = json.dumps(resp.__dict__, default=str, indent=2)[:500]
+                    print(f"[DEBUG analyze_screen] full response structure: {resp_repr}")
+                except Exception:
+                    print(f"[DEBUG analyze_screen] full response structure: {repr(resp)[:500]}")
 
-        # If the model gave nothing usable, signal "no update"
+        # If empty, try fallback model
         if not text:
-            print("analyze_screen: empty content from model")
-            return None
+            print("analyze_screen: empty content from model, trying fallback")
+            try:
+                resp = client.responses.create(
+                    model=FALLBACK_MODEL,
+                    input=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
+                        ]
+                    }],
+                    max_output_tokens=50
+                )
+                text = resp.output_text if hasattr(resp, 'output_text') else ""
+                if text:
+                    text = text.strip()
+                    print(f"[FALLBACK] analyze_screen succeeded with {FALLBACK_MODEL}")
+            except Exception as e:
+                print(f"[FALLBACK] analyze_screen error: {e}")
+
+        # If still empty, return error
+        if not text:
+            print("analyze_screen: empty content from model (both primary and fallback)")
+            return "⚠️ Unable to analyze screen — model returned empty response"
 
         return text
 
@@ -250,57 +383,87 @@ def start_overlay(get_message_func):
             nonlocal is_busy
             try:
                 img = capture_screen()
-                buffered = BytesIO()
-                img.save(buffered, format="PNG")
-                img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                img_bytes = prepare_image_for_upload(img)
+                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-                resp = client.chat.completions.create(
-                    model="gpt-5",
-                    messages=[
+                system_prompt = (
+                    f"You are {ASSISTANT_NAME}, an intelligent on-screen assistant. "
+                    f"You can SEE the user's current screen image; base your responses on what is visibly present "
+                    f"(Odoo windows, invoices, code editors, filenames, UI elements, etc.) plus the user's question. "
+                    f"Avoid generic coaching or vague advice like 'stay focused' or 'double-check everything' "
+                    f"unless the screen truly provides no useful cues. "
+                    f"Keep replies focused and concise: ideally 1–3 short sentences directly about what is on screen "
+                    f"and how it relates to the user's request."
+                )
+
+                # Try primary model first
+                resp = client.responses.create(
+                    model=PRIMARY_MODEL,
+                    input=[
                         {
                             "role": "system",
-                            "content": (
-                                f"You are {ASSISTANT_NAME}, an intelligent on-screen assistant. "
-                                f"You can SEE the user's current screen image; base your responses on what is visibly present "
-                                f"(Odoo windows, invoices, code editors, filenames, UI elements, etc.) plus the user's question. "
-                                f"Avoid generic coaching or vague advice like 'stay focused' or 'double-check everything' "
-                                f"unless the screen truly provides no useful cues. "
-                                f"Keep replies focused and concise: ideally 1–3 short sentences directly about what is on screen "
-                                f"and how it relates to the user's request."
-                            ),
+                            "content": [{"type": "input_text", "text": system_prompt}]
                         },
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": user_input},
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                                {"type": "input_text", "text": user_input},
+                                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
                             ]
                         }
                     ],
-                    max_completion_tokens=250
+                    max_output_tokens=250
                 )
 
-                # Robustly parse GPT-5 response content
-                reply = ""
-                try:
-                    msg = resp.choices[0].message
-                    content = getattr(msg, "content", None)
+                reply = resp.output_text if hasattr(resp, 'output_text') else ""
+                if reply:
+                    reply = reply.strip()
+                
+                # Debug logging
+                if DEBUG_MODEL_IO:
+                    print(f"[DEBUG send_chat_message] output_text: {reply[:300] if reply else '(empty)'}")
+                    if not reply:
+                        try:
+                            if hasattr(resp, 'model_dump'):
+                                resp_repr = json.dumps(resp.model_dump(), default=str, indent=2)[:500]
+                            else:
+                                resp_repr = json.dumps(resp.__dict__, default=str, indent=2)[:500]
+                            print(f"[DEBUG send_chat_message] full response structure: {resp_repr}")
+                        except Exception:
+                            print(f"[DEBUG send_chat_message] full response structure: {repr(resp)[:500]}")
 
-                    if isinstance(content, str):
-                        reply = content.strip()
-                    elif isinstance(content, list):
-                        parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                val = part.get("text", "").strip()
-                                if val:
-                                    parts.append(val)
-                        reply = " ".join(parts).strip()
-                except Exception as e:
-                    reply = f"⚠️ Parsing error: {e}"
-
+                # If empty, try fallback model
                 if not reply:
-                    reply = "I'm here — what would you like me to do?"
+                    print("send_chat_message: empty content from model, trying fallback")
+                    try:
+                        resp = client.responses.create(
+                            model=FALLBACK_MODEL,
+                            input=[
+                                {
+                                    "role": "system",
+                                    "content": [{"type": "input_text", "text": system_prompt}]
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "input_text", "text": user_input},
+                                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
+                                    ]
+                                }
+                            ],
+                            max_output_tokens=250
+                        )
+                        reply = resp.output_text if hasattr(resp, 'output_text') else ""
+                        if reply:
+                            reply = reply.strip()
+                            print(f"[FALLBACK] send_chat_message succeeded with {FALLBACK_MODEL}")
+                    except Exception as e:
+                        print(f"[FALLBACK] send_chat_message error: {e}")
+
+                # If still empty, return clear error message
+                if not reply:
+                    print("send_chat_message: empty content from model (both primary and fallback)")
+                    reply = "⚠️ Unable to process request — model returned empty response. Please try again."
 
                 print(f"💬 {ASSISTANT_NAME} replied: {reply}")
             except Exception as e:
@@ -466,6 +629,7 @@ def start_overlay(get_message_func):
     def update_loop(first_run=False):
         if first_run:
             set_message("Starting up... Preparing model.")
+            threading.Thread(target=debug_test_text_only, daemon=True).start()
             threading.Thread(target=warm_up_model, daemon=True).start()
             root.after(5000, lambda: fetch_and_reschedule())
             return
